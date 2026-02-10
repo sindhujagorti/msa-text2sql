@@ -1,0 +1,19 @@
+# Data
+spider/
+*.sqlite
+*.db
+
+# Outputs
+outputs/*.jsonl
+outputs/*.txt
+outputs/*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
