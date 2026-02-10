@@ -35,7 +35,7 @@ fi
 mkdir -p outputs
 
 echo "Running B..."
-python baselines/infer_text2sql.py \
+python baseline/infer_text2sql.py \
   --model cssupport/t5-small-awesome-text-to-sql \
   --spider_dir "$SPIDER_DIR" \
   --split "$SPLIT" \
@@ -43,7 +43,7 @@ python baselines/infer_text2sql.py \
   --out outputs/preds_B_t5small.jsonl
 
 echo "Running C..."
-python baselines/infer_text2sql.py \
+python baseline/infer_text2sql.py \
   --model suriya7/t5-base-text-to-sql \
   --spider_dir "$SPIDER_DIR" \
   --split "$SPLIT" \
@@ -51,7 +51,7 @@ python baselines/infer_text2sql.py \
   --out outputs/preds_C_t5base.jsonl
 
 echo "Running A..."
-python baselines/infer_text2sql.py \
+python baseline/infer_text2sql.py \
   --model tscholak/1zha5ono \
   --spider_dir "$SPIDER_DIR" \
   --split "$SPLIT" \
