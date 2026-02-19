@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import re
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Tuple
 
 import torch
 from tqdm import tqdm
@@ -10,6 +10,16 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 
 def load_spider_split(spider_dir: str, split: str) -> Tuple[List[dict], Dict[str, dict]]:
+    """
+    Loads SPIDER split JSON and tables.json from a local SPIDER directory.
+
+    Expected structure:
+      spider_dir/
+        train_spider.json
+        dev.json
+        tables.json
+        database/<db_id>/<db_id>.sqlite
+    """
     if split == "train":
         data_path = os.path.join(spider_dir, "train_spider.json")
     elif split == "dev":
@@ -32,12 +42,6 @@ def load_spider_split(spider_dir: str, split: str) -> Tuple[List[dict], Dict[str
 
     tables_by_db = {t["db_id"]: t for t in tables}
     return data, tables_by_db
-
-
-def get_table_names(db_id: str, tables_by_db: Dict[str, dict]) -> List[str]:
-    if db_id not in tables_by_db:
-        raise KeyError(f"db_id not found in tables.json: {db_id}")
-    return tables_by_db[db_id]["table_names_original"]
 
 
 def build_schema_str_from_tables(db_id: str, tables_by_db: Dict[str, dict]) -> str:
@@ -65,12 +69,14 @@ def build_schema_str_from_tables(db_id: str, tables_by_db: Dict[str, dict]) -> s
         cols = ", ".join(by_table[t_id])
         lines.append(f"Table {t_name}: {cols}")
 
+    # Primary keys
     pk_lines: List[str] = []
     for col_idx in primary_keys:
         t_id, c_name = col_names[col_idx]
         if t_id != -1:
             pk_lines.append(f"{table_names[t_id]}.{c_name}")
 
+    # Foreign keys
     fk_lines: List[str] = []
     for c1, c2 in foreign_keys:
         t1, c1n = col_names[c1]
@@ -86,21 +92,18 @@ def build_schema_str_from_tables(db_id: str, tables_by_db: Dict[str, dict]) -> s
     return "\n".join(lines)
 
 
-def build_prompt(schema: str, question: str, prompt_style: str, allowed_tables: List[str]) -> str:
+def build_prompt(schema: str, question: str, prompt_style: str) -> str:
     """
-    Keep instructions short and avoid prominent tokens like 'SQLite'/'SQL'.
-    Add explicit allowed table list to reduce hallucinated tables (e.g., 'Country', 'concert_Name').
+    IMPORTANT: Keep instructions short and avoid prominent tokens like 'SQLite'/'SQL',
+    since small seq2seq models may copy them into the output.
     """
-    tables_line = "Allowed tables: " + ", ".join(allowed_tables)
-
     if prompt_style == "schema_question_sql":
         return (
-            "Task: Write one query that answers the question using the given schema.\n"
+            "Task: Write a single query that answers the question using the given schema.\n"
             "Rules:\n"
-            "- Use only tables and columns from the schema.\n"
-            "- Use only the allowed table names.\n"
-            "- Return only the query text.\n"
-            f"{tables_line}\n\n"
+            "- Use only tables and columns that appear in the schema.\n"
+            "- Use table and column names exactly as written in the schema.\n"
+            "- Return only the query text.\n\n"
             f"Schema:\n{schema}\n\n"
             f"Question: {question}\n"
             "Answer:"
@@ -108,7 +111,7 @@ def build_prompt(schema: str, question: str, prompt_style: str, allowed_tables: 
 
     if prompt_style == "direct":
         return (
-            f"{tables_line}\n\n"
+            "Return only the query text.\n\n"
             f"{schema}\n\n"
             f"Question: {question}\n"
             "Answer:"
@@ -118,6 +121,13 @@ def build_prompt(schema: str, question: str, prompt_style: str, allowed_tables: 
 
 
 def clean_pred_sql(text: str) -> str:
+    """
+    Conservative cleaner:
+    - Keep only from the first SELECT onward (drops echoed instructions).
+    - If no SELECT exists, return empty string (so eval_exec can count it as empty_pred).
+    - Cut off if the model starts re-printing instructions mid-output.
+    - Remove a couple common instruction-echo artifacts.
+    """
     if not text:
         return ""
 
@@ -131,32 +141,31 @@ def clean_pred_sql(text: str) -> str:
 
     s = s[m.start():].strip()
 
+    # Truncate anything after a code fence end if present
     if "```" in s:
         s = s.split("```", 1)[0].strip()
 
-    s = s.strip()
+    # If instruction markers show up, cut them off
+    kill_markers = ["schema:", "question:", "answer:", "rules:", "task:"]
+    low = s.lower()
+    cut = len(s)
+    for km in kill_markers:
+        idx = low.find(km)
+        if idx != -1:
+            cut = min(cut, idx)
+    s = s[:cut].strip()
+
+    # Remove a common echo artifact (harmless if absent)
+    s = re.sub(r"\ballowed\s+tables\b", "", s, flags=re.IGNORECASE).strip()
+
+    # Remove trailing semicolons but don't force one
     s = s.rstrip(";").strip()
+
+    # Try to delete stray "table" token that sometimes appears in malformed outputs
+    s = re.sub(r"\bfrom\s+table\b", "from", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bjoin\s+table\b", "join", s, flags=re.IGNORECASE)
+
     return s
-
-
-def extract_tables_from_sql(sql: str) -> Set[str]:
-    """
-    Extract table identifiers appearing after FROM/JOIN.
-    This is intentionally simple (works well enough for Spider baseline diagnostics).
-    """
-    if not sql:
-        return set()
-
-    s = sql
-    # remove quoted strings to avoid confusing FROM 'x'
-    s = re.sub(r"'[^']*'", "''", s)
-    s = re.sub(r'"[^"]*"', '""', s)
-
-    # capture FROM <name> or JOIN <name>
-    found = set()
-    for m in re.finditer(r"\b(from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)", s, flags=re.IGNORECASE):
-        found.add(m.group(2))
-    return found
 
 
 @torch.no_grad()
@@ -186,11 +195,6 @@ def main() -> None:
         choices=["schema_question_sql", "direct"],
     )
     ap.add_argument("--max_new_tokens", type=int, default=128)
-    ap.add_argument(
-        "--reject_unknown_tables",
-        action="store_true",
-        help="If set, blank predictions that reference tables not in schema.",
-    )
     args = ap.parse_args()
 
     data, tables_by_db = load_spider_split(args.spider_dir, args.split)
@@ -207,21 +211,11 @@ def main() -> None:
     with open(args.out, "w", encoding="utf-8") as f:
         for ex in tqdm(subset, desc=f"Running {args.model}"):
             db_id = ex["db_id"]
-            allowed_tables = get_table_names(db_id, tables_by_db)
-            allowed_set = set(allowed_tables)
-
             schema = build_schema_str_from_tables(db_id, tables_by_db)
-            prompt = build_prompt(schema, ex["question"], args.prompt_style, allowed_tables)
+            prompt = build_prompt(schema, ex["question"], args.prompt_style)
 
             pred = generate_sql(tok, model, prompt, args.max_new_tokens)
             pred_sql = clean_pred_sql(pred)
-
-            if args.reject_unknown_tables and pred_sql:
-                used = extract_tables_from_sql(pred_sql)
-                unknown = {t for t in used if t not in allowed_set}
-                if unknown:
-                    # Blank it out so eval_exec counts it as empty_pred (cleaner diagnostics)
-                    pred_sql = ""
 
             rec = {
                 "model": args.model,
