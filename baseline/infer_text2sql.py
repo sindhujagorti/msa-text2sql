@@ -94,15 +94,14 @@ def build_schema_str_from_tables(db_id: str, tables_by_db: Dict[str, dict]) -> s
 
 def build_prompt(schema: str, question: str, prompt_style: str) -> str:
     """
-    IMPORTANT: Keep instructions short and avoid prominent tokens like 'SQLite'/'SQL',
-    since small seq2seq models may copy them into the output.
+    IMPORTANT: Avoid putting the tokens 'SQL' or 'SQLite' prominently in the prompt,
+    because small seq2seq models tend to copy them into the output (e.g., FROM SQLite).
     """
     if prompt_style == "schema_question_sql":
         return (
             "Task: Write a single query that answers the question using the given schema.\n"
             "Rules:\n"
             "- Use only tables and columns that appear in the schema.\n"
-            "- Use table and column names exactly as written in the schema.\n"
             "- Return only the query text.\n\n"
             f"Schema:\n{schema}\n\n"
             f"Question: {question}\n"
@@ -110,12 +109,7 @@ def build_prompt(schema: str, question: str, prompt_style: str) -> str:
         )
 
     if prompt_style == "direct":
-        return (
-            "Return only the query text.\n\n"
-            f"{schema}\n\n"
-            f"Question: {question}\n"
-            "Answer:"
-        )
+        return f"{schema}\n\nQuestion: {question}\nAnswer:"
 
     raise ValueError(f"Unknown prompt_style: {prompt_style}")
 
@@ -123,10 +117,10 @@ def build_prompt(schema: str, question: str, prompt_style: str) -> str:
 def clean_pred_sql(text: str) -> str:
     """
     Conservative cleaner:
-    - Keep only from the first SELECT onward (drops echoed instructions).
-    - If no SELECT exists, return empty string (so eval_exec can count it as empty_pred).
-    - Cut off if the model starts re-printing instructions mid-output.
-    - Remove a couple common instruction-echo artifacts.
+    - If we see a SELECT ... statement, extract from first SELECT to the end.
+    - Remove code fences/backticks.
+    - Do NOT force a semicolon.
+    - If no SELECT exists, return empty string (so eval_exec counts it as empty_pred).
     """
     if not text:
         return ""
@@ -145,26 +139,11 @@ def clean_pred_sql(text: str) -> str:
     if "```" in s:
         s = s.split("```", 1)[0].strip()
 
-    # If instruction markers show up, cut them off
-    kill_markers = ["schema:", "question:", "answer:", "rules:", "task:"]
-    low = s.lower()
-    cut = len(s)
-    for km in kill_markers:
-        idx = low.find(km)
-        if idx != -1:
-            cut = min(cut, idx)
-    s = s[:cut].strip()
-
-    # Remove a common echo artifact (harmless if absent)
-    s = re.sub(r"\ballowed\s+tables\b", "", s, flags=re.IGNORECASE).strip()
+    # Strip trailing junk lines that are clearly not part of the query
+    s = s.strip()
 
     # Remove trailing semicolons but don't force one
     s = s.rstrip(";").strip()
-
-    # Try to delete stray "table" token that sometimes appears in malformed outputs
-    s = re.sub(r"\bfrom\s+table\b", "from", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bjoin\s+table\b", "join", s, flags=re.IGNORECASE)
-
     return s
 
 
@@ -178,6 +157,8 @@ def generate_sql(tok, model, prompt: str, max_new_tokens: int) -> str:
         max_new_tokens=max_new_tokens,
         do_sample=False,
         num_beams=1,
+        # temperature is ignored when do_sample=False
+        temperature=0.0,
     )
     return tok.decode(out[0], skip_special_tokens=True).strip()
 
