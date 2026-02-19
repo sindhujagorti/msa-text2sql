@@ -59,24 +59,24 @@ def build_schema_str_from_tables(db_id: str, tables_by_db: Dict[str, dict]) -> s
     foreign_keys = t.get("foreign_keys", [])  # list of [col_idx_1, col_idx_2]
 
     by_table: Dict[int, List[str]] = {i: [] for i in range(len(table_names))}
-    for col_idx, ((t_id, c_name), c_type) in enumerate(zip(col_names, col_types)):
+    for ((t_id, c_name), c_type) in zip(col_names, col_types):
         if t_id == -1:
             continue
         by_table[t_id].append(f"{c_name} ({c_type})")
 
-    lines = []
+    lines: List[str] = []
     for t_id, t_name in enumerate(table_names):
         cols = ", ".join(by_table[t_id])
         lines.append(f"Table {t_name}: {cols}")
 
-    # Primary keys: map col_idx -> table.col
+    # Primary keys
     pk_lines: List[str] = []
     for col_idx in primary_keys:
         t_id, c_name = col_names[col_idx]
         if t_id != -1:
             pk_lines.append(f"{table_names[t_id]}.{c_name}")
 
-    # Foreign keys: map pairs col_idx -> table.col
+    # Foreign keys
     fk_lines: List[str] = []
     for c1, c2 in foreign_keys:
         t1, c1n = col_names[c1]
@@ -93,55 +93,57 @@ def build_schema_str_from_tables(db_id: str, tables_by_db: Dict[str, dict]) -> s
 
 
 def build_prompt(schema: str, question: str, prompt_style: str) -> str:
+    """
+    IMPORTANT: Avoid putting the tokens 'SQL' or 'SQLite' prominently in the prompt,
+    because small seq2seq models tend to copy them into the output (e.g., FROM SQLite).
+    """
     if prompt_style == "schema_question_sql":
         return (
-            "You are a text-to-SQL system.\n"
-            "Write ONE valid SQLite SQL query that answers the question.\n"
+            "Task: Write a single query that answers the question using the given schema.\n"
             "Rules:\n"
-            "- Output ONLY the SQL query.\n"
-            "- Do NOT include explanations.\n"
-            "- Do NOT include the word 'SQL' or a prefix like 'SQL:'.\n"
-            "- Use ONLY table and column names from the schema.\n"
-            "- Use correct SQLite syntax.\n\n"
-            f"{schema}\n\n"
+            "- Use only tables and columns that appear in the schema.\n"
+            "- Return only the query text.\n\n"
+            f"Schema:\n{schema}\n\n"
             f"Question: {question}\n"
-            "Query:"
+            "Answer:"
         )
 
     if prompt_style == "direct":
-        return (
-            "Output ONLY a valid SQLite SQL query.\n\n"
-            f"{schema}\n\n"
-            f"Question: {question}\n"
-            "Query:"
-        )
+        return f"{schema}\n\nQuestion: {question}\nAnswer:"
 
     raise ValueError(f"Unknown prompt_style: {prompt_style}")
 
 
 def clean_pred_sql(text: str) -> str:
+    """
+    Conservative cleaner:
+    - If we see a SELECT ... statement, extract from first SELECT to the end.
+    - Remove code fences/backticks.
+    - Do NOT force a semicolon.
+    - If no SELECT exists, return empty string (so eval_exec counts it as empty_pred).
+    """
     if not text:
         return ""
 
     s = text.strip()
+    s = s.replace("```sql", "```").replace("```SQL", "```")
+    s = s.strip("`").strip()
 
-    # If the model includes "SQL:" or "Query:", keep only the last segment after it
-    parts = re.split(r"\b(?:sql|query)\s*:\s*", s, flags=re.IGNORECASE)
-    if len(parts) > 1:
-        s = parts[-1].strip()
-
-    # Keep only from the first SELECT (drops any leading chatter)
     m = re.search(r"\bselect\b", s, flags=re.IGNORECASE)
-    if m:
-        s = s[m.start():]
+    if not m:
+        return ""
 
-    # Strip code fences / backticks
-    s = s.strip().strip("`").strip()
+    s = s[m.start():].strip()
 
-    # Normalize trailing semicolon
+    # Truncate anything after a code fence end if present
+    if "```" in s:
+        s = s.split("```", 1)[0].strip()
+
+    # Strip trailing junk lines that are clearly not part of the query
+    s = s.strip()
+
+    # Remove trailing semicolons but don't force one
     s = s.rstrip(";").strip()
-    if s:
-        s = s + ";"
     return s
 
 
@@ -155,7 +157,7 @@ def generate_sql(tok, model, prompt: str, max_new_tokens: int) -> str:
         max_new_tokens=max_new_tokens,
         do_sample=False,
         num_beams=1,
-        # temperature is ignored when do_sample=False, but leaving it harmless
+        # temperature is ignored when do_sample=False
         temperature=0.0,
     )
     return tok.decode(out[0], skip_special_tokens=True).strip()
@@ -193,8 +195,8 @@ def main() -> None:
             schema = build_schema_str_from_tables(db_id, tables_by_db)
             prompt = build_prompt(schema, ex["question"], args.prompt_style)
 
-            pred_sql = generate_sql(tok, model, prompt, args.max_new_tokens)
-            pred_sql = clean_pred_sql(pred_sql)
+            pred = generate_sql(tok, model, prompt, args.max_new_tokens)
+            pred_sql = clean_pred_sql(pred)
 
             rec = {
                 "model": args.model,
